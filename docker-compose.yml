@@ -98,7 +98,10 @@ services:
   #  fermé pour l'instant — on travaille en mode "agent intégré").
   # ───────────────────────────────────────────────────────────
   jenkins:
-    image: jenkins/jenkins:lts-jdk17
+    build:
+      context: ./jenkins
+      dockerfile: Dockerfile
+    image: proshop-jenkins:custom    # image dérivée avec docker CLI + node
     container_name: proshop-jenkins
     restart: unless-stopped
     user: root            # nécessaire pour pouvoir lire /var/run/docker.sock
@@ -111,8 +114,10 @@ services:
       # Socket Docker de l'hôte → Jenkins peut builder des images
       # et invoquer docker compose sans installer son propre démon.
       - /var/run/docker.sock:/var/run/docker.sock
+      # Le code source courant — accessible depuis le pipeline pour
+      # `docker compose up -d` sur les mêmes fichiers que la stack hôte.
+      - .:/workspace-host:ro
     environment:
-      # Désactive l'écran de bienvenue post-install (optionnel)
       JAVA_OPTS: '-Djenkins.install.runSetupWizard=true'
 
 volumes:
