@@ -1,0 +1,92 @@
+# Docker Compose — Stack ProShop v2
+#
+# 3 services + 1 volume + 1 réseau dédié.
+# Cette version (P.3) expose temporairement les ports frontend (3000) et
+# backend (5000) à l'extérieur pour les tests. La P.4 ajoutera Nginx comme
+# unique point d'entrée et masquera ces ports.
+
+services:
+  # ───────────────────────────────────────────────────────────
+  #  MongoDB — stockage persistant via volume nommé.
+  #  Le port 27017 N'EST PAS publié → DB joignable uniquement
+  #  depuis le réseau Docker `proshop-net`.
+  # ───────────────────────────────────────────────────────────
+  mongo:
+    image: mongo:7
+    container_name: proshop-mongo
+    restart: unless-stopped
+    networks:
+      - proshop-net
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      # ping de la commande mongosh — retourne 0 si le serveur répond
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ───────────────────────────────────────────────────────────
+  #  Backend Node/Express — attend que MongoDB soit healthy
+  #  avant de démarrer (depends_on : condition: service_healthy).
+  # ───────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: proshop-backend:local
+    container_name: proshop-backend
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    networks:
+      - proshop-net
+    env_file:
+      - .env
+    environment:
+      # Surcharge éventuelle : on force ces valeurs au cas où le .env est absent.
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: 5000
+      MONGO_URI: ${MONGO_URI:-mongodb://mongo:27017/proshop}
+    ports:
+      # ⚠️ Temporaire P.3 — supprimé en P.4 (Nginx prend le relais).
+      - '5000:5000'
+
+  # ───────────────────────────────────────────────────────────
+  #  Frontend React (Nginx interne qui sert le bundle statique).
+  #  Pas besoin d'env_file ici : le bundle est compilé au build.
+  # ───────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: proshop-frontend:local
+    container_name: proshop-frontend
+    restart: unless-stopped
+    networks:
+      - proshop-net
+    ports:
+      # ⚠️ Temporaire P.3 — supprimé en P.4.
+      - '3000:3000'
+
+# ───────────────────────────────────────────────────────────
+#  Volume persistant pour MongoDB.
+#  Le `name:` explicite empêche Compose de préfixer avec le
+#  nom du projet (utile pour retrouver les données après un
+#  `docker compose down` puis `up`).
+# ───────────────────────────────────────────────────────────
+volumes:
+  mongo-data:
+    name: proshop-mongo-data
+
+# ───────────────────────────────────────────────────────────
+#  Réseau dédié : isole nos services du bridge par défaut.
+#  Tous les services se voient mutuellement par leur nom de
+#  service (ex: `mongo`, `backend`) grâce au DNS Docker interne.
+# ───────────────────────────────────────────────────────────
+networks:
+  proshop-net:
+    name: proshop-net
+    driver: bridge

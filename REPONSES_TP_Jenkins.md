@@ -302,3 +302,130 @@ node:node /app`).
 Techniques d'optimisation appliquées dans ce TP : base `alpine`, multi-stage, `--omit=dev`,
 `.dockerignore`, ordre des `COPY` pour le cache layer.
 
+---
+
+## P.3 — Orchestration avec Docker Compose
+
+### Fichiers livrés
+
+- `docker-compose.yml` — 3 services (`mongo`, `backend`, `frontend`) + 1 volume nommé
+  `proshop-mongo-data` + 1 réseau dédié `proshop-net`.
+- `.env.example` — template documenté des variables d'env.
+- `.env` (LOCAL, non commité) — valeurs réelles.
+
+### Choix d'architecture
+
+1. **Service `mongo` SANS `ports:` publiés** (Q11). MongoDB n'expose son port 27017 que dans
+   le réseau Docker interne `proshop-net`. Le backend l'atteint via `mongodb://mongo:27017` (DNS
+   automatique fourni par Docker pour le nom de service). Aucun client extérieur ne peut s'y
+   connecter — ni par accident, ni par scan.
+
+2. **`depends_on: condition: service_healthy`** sur le backend. Compose démarre d'abord mongo,
+   attend que son healthcheck (`db.adminCommand('ping')`) renvoie OK, **puis** démarre le
+   backend. Sans cette condition, le backend tenterait de se connecter alors que mongo est
+   encore en train d'initialiser ses fichiers de données → crash + restart loop.
+
+3. **Healthcheck mongo** via `mongosh --eval "db.adminCommand('ping').ok"`. C'est la commande
+   officielle recommandée par MongoDB Inc. pour valider qu'un nœud est prêt.
+
+4. **Volume nommé `proshop-mongo-data`** monté sur `/data/db` (le path par défaut du dataset
+   MongoDB dans l'image officielle). Le `name:` explicite préfixe pas le projet, donc le volume
+   survit à un `docker compose down` standard.
+
+5. **Réseau `proshop-net` en `driver: bridge`** — explicite plutôt que d'utiliser le bridge par
+   défaut. Cela permet d'avoir un DNS interne propre et d'isoler clairement du reste de Docker
+   sur la machine hôte.
+
+6. **`env_file: .env`** pour le backend, avec **surcharge `environment:`** pour les valeurs
+   non-secrètes (`NODE_ENV`, `PORT`, `MONGO_URI`) qui ont des valeurs par défaut sûres. Si le
+   `.env` est absent, le backend démarre quand même avec les bonnes valeurs (mais sans clés
+   PayPal donc paiement KO).
+
+### Validation locale
+
+```bash
+docker compose up -d
+docker compose exec backend node backend/seeder.js   # injecte 6 produits + 2 users
+curl http://localhost:5000/api/products | head       # 6 produits retournés
+```
+
+À l'issue du `docker compose up -d` :
+
+| Conteneur          | État              | Port hôte publié |
+| ------------------ | ----------------- | ---------------- |
+| `proshop-mongo`    | Up (healthy)      | (aucun — interne)|
+| `proshop-backend`  | Up (healthy)      | 5000             |
+| `proshop-frontend` | Up                | 3000             |
+
+### Réponses Q9-Q11
+
+**Q9 — Pourquoi Docker Compose plutôt que des `docker run` manuels ?**
+
+Lancer 3 conteneurs avec des `docker run` séparés implique :
+
+- 3 commandes longues à taper sans se tromper (image, ports, env, volumes, network…).
+- Gérer manuellement l'ordre de démarrage (attendre que mongo soit prêt avant de lancer le
+  backend).
+- Créer manuellement le réseau (`docker network create proshop-net`) et chaque volume.
+- Synchroniser ces commandes entre développeurs (un dev a `--name proshop-back`, un autre
+  `--name proshop-backend` → bordel).
+
+Docker Compose résout ça en transformant cette configuration en un **fichier déclaratif
+versionné** (`docker-compose.yml`) :
+
+- **Une seule commande** lance toute la stack : `docker compose up -d`.
+- **Une seule commande** arrête tout : `docker compose down`.
+- **Reproductibilité** : le fichier est dans le repo, tous les devs ont la même config.
+- **Ordre de démarrage géré** déclarativement par `depends_on` avec healthcheck conditions.
+- **Réseaux et volumes créés automatiquement** au premier `up`.
+- **Variables d'environnement gérées** via `env_file` et `environment`.
+- **Logs centralisés** : `docker compose logs -f` montre les logs de tous les services en
+  parallèle, par ordre chronologique.
+
+C'est aussi la base de Docker Swarm et de Kubernetes (qui utilisent des fichiers déclaratifs
+similaires) : apprendre Compose, c'est un pas vers l'orchestration plus complexe.
+
+**Q10 — À quoi sert un volume Docker ?**
+
+Un volume Docker est un **espace de stockage persistant** géré par Docker, indépendant du
+cycle de vie des conteneurs. Il vit sur le filesystem hôte (typiquement sous
+`/var/lib/docker/volumes/<name>`) mais Docker s'occupe de tout : création, montage, snapshots,
+backup, etc.
+
+**Sans volume persistant pour MongoDB** : le conteneur Mongo écrit ses fichiers de données
+dans son propre filesystem éphémère (la "writable layer" du conteneur). À chaque `docker
+compose down` puis `up`, le conteneur est recréé from scratch — **toutes les données sont
+perdues**. Pour une DB, c'est catastrophique : les produits, les utilisateurs, les commandes,
+tout disparaît.
+
+**Avec le volume `proshop-mongo-data`** monté sur `/data/db` : Mongo écrit dans le volume, qui
+est stocké en dehors du conteneur. Le conteneur peut être détruit et recréé sans perte. C'est
+exactement ce qu'on a observé après le `docker compose down && up` : les 6 produits seedés
+étaient toujours là.
+
+Autres usages des volumes : partager des fichiers entre conteneurs (logs, uploads), conserver
+les caches entre builds, monter de la config en lecture seule, partager un répertoire entre
+l'hôte et un conteneur (bind mount, `./local-dir:/app/data`).
+
+**Q11 — Pourquoi un réseau Docker dédié plutôt que le bridge par défaut ?**
+
+Sur le bridge par défaut de Docker :
+
+- **Pas de DNS automatique entre conteneurs.** Sur le bridge default, les conteneurs ne
+  peuvent s'atteindre que par adresse IP (qui change à chaque redémarrage), ou avec l'option
+  `--link` (deprecated). Sur un réseau dédié custom, chaque conteneur est résolvable par son
+  nom de service (DNS interne automatique) — c'est exactement comment le backend trouve
+  `mongo:27017`.
+
+- **Tous les conteneurs partagent le même bridge default.** Si on lance d'autres stacks Docker
+  sur la même machine, elles voient nos conteneurs et peuvent les pinger / scanner. Avec un
+  réseau dédié, **seuls nos services se voient**. C'est une vraie isolation logique.
+
+- **Pas de contrôle des règles iptables.** Le bridge default a une config NAT fixe que Docker
+  gère sans qu'on puisse intervenir. Avec un réseau custom, on peut ajouter des labels, des
+  drivers IPAM, des sous-réseaux dédiés, etc.
+
+En pratique : créer un réseau dédié coûte 0 (un seul `networks:` block dans le compose) et
+apporte une isolation, un DNS propre et une lisibilité réelles. C'est la pratique standard
+pour toute stack multi-conteneurs.
+
