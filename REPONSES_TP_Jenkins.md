@@ -541,3 +541,165 @@ REVERSE PROXY :    [Internet] → [Reverse Proxy] → [Serveur(s) internes]
 Dans les deux cas, c'est exactement le **même logiciel** qui peut faire l'un ou l'autre
 (Nginx, HAProxy, Traefik...). C'est la position dans l'architecture qui définit le rôle.
 
+---
+
+## P.5 — Jenkins : Installation & Premier job
+
+### Mise en place
+
+Jenkins est ajouté à `docker-compose.yml` comme un service supplémentaire :
+
+```yaml
+jenkins:
+  image: jenkins/jenkins:lts-jdk17
+  container_name: proshop-jenkins
+  user: root
+  networks:
+    - proshop-net
+  ports:
+    - '8080:8080'
+  volumes:
+    - jenkins-home:/var/jenkins_home
+    - /var/run/docker.sock:/var/run/docker.sock
+```
+
+Choix techniques justifiés :
+
+- **`lts-jdk17`** : version LTS (Long Term Support) recommandée pour la production,
+  avec OpenJDK 17 (LTS Java).
+- **Volume nommé `jenkins-home`** monté sur `/var/jenkins_home` : persiste **toute** la
+  configuration Jenkins (utilisateurs, jobs, credentials, historique des builds, plugins).
+- **Socket Docker monté** (`/var/run/docker.sock`) : approche **Docker-out-of-Docker (DooD)**.
+  Jenkins n'a pas son propre démon Docker imbriqué — il utilise le démon de l'hôte. Cela
+  permet à Jenkins de `docker build` et `docker compose up` sans complexité supplémentaire
+  (cf. Q22 du TP).
+- **`user: root`** : nécessaire pour lire le socket Docker monté (qui appartient à root sur la
+  plupart des hôtes).
+- **Port 8080 publié** : seule porte d'accès à l'UI Jenkins. Le port 50000 (agents distants)
+  n'est pas publié car on travaille avec l'agent intégré.
+- **Réseau partagé `proshop-net`** : Jenkins peut atteindre les autres services par leur nom
+  (`mongo`, `backend`, etc.) — utile pour les health checks dans le pipeline P.7.
+
+### Workflow de setup réalisé
+
+1. `docker compose up -d jenkins` → conteneur démarre.
+2. Récupération du mot de passe initial :
+   `docker exec proshop-jenkins cat /var/jenkins_home/secrets/initialAdminPassword`.
+3. Ouverture de http://127.0.0.1:8080 → saisie du mot de passe.
+4. Choix **"Install suggested plugins"** → Jenkins installe automatiquement Git, Pipeline,
+   Workflow Aggregator, Credentials, etc.
+5. Création de l'utilisateur admin avec un mot de passe personnel.
+6. Vérification de la présence des plugins **Docker Pipeline** et **Git** dans
+   *Manage Jenkins → Plugins → Installed*.
+7. Création d'un premier job **Freestyle** :
+   - Nom : `proshop-freestyle-test`
+   - Source Code Management : Git, URL `https://github.com/HbtVictor/proshop-v2-jenkins.git`,
+     branch `*/main`.
+   - Build step : *Execute shell* avec `ls -la && cat package.json | head -20`.
+8. Clic **Build Now** → boule bleue verte (success). Lecture des logs via *Console Output*.
+
+### Réponses Q14-Q17
+
+**Q14 — Qu'est-ce que Jenkins, et différence avec GitHub Actions ?**
+
+Jenkins est un **serveur d'automatisation open-source** créé en 2011 (forké du projet
+Hudson). Il automatise des tâches répétitives liées au développement : build, tests, packaging,
+déploiement, notifications, etc. C'est l'outil historique du CI/CD on-premise.
+
+Problème qu'il résout : avant Jenkins, déployer une appli en équipe demandait à un humain
+d'exécuter manuellement une séquence de commandes (npm install, tests, build, scp vers le
+serveur, redémarrer le service...). C'est lent, erratique, non traçable. Jenkins automatise
+cette séquence et la déclenche sur événement (commit Git, cron, webhook).
+
+Différences avec GitHub Actions :
+
+| Critère                    | Jenkins                              | GitHub Actions                       |
+| -------------------------- | ------------------------------------ | ------------------------------------ |
+| **Hébergement**            | Auto-hébergé (on-premise / cloud privé) | Cloud GitHub par défaut (runners gérés) |
+| **Couplage avec le SCM**   | Indépendant (Git, SVN, Mercurial...) | Couplé à GitHub                      |
+| **Config**                 | UI + Jenkinsfile (Groovy DSL)        | Fichiers YAML                        |
+| **Plugins**                | 1800+ plugins, écosystème mature     | Marketplace d'actions réutilisables  |
+| **Coût**                   | Gratuit (mais coût d'infra à payer)  | Gratuit jusqu'à un quota, puis payant |
+| **Contrôle**               | Total (réseau interne, secrets, OS)  | Limité (sandbox GitHub)              |
+| **Maintenance**            | À ta charge (mises à jour, sécu...)  | GitHub gère tout                     |
+
+Le choix dépend du contexte : Jenkins quand on a besoin de contrôle (banques, gov,
+data-sensitive), GitHub Actions quand on veut zéro maintenance et que GitHub est déjà le SCM.
+
+**Q15 — Qu'est-ce qu'un "job" Jenkins ? Freestyle vs Pipeline ?**
+
+Un **job** Jenkins (renommé "Project" puis "Item" dans les versions récentes) est une unité
+d'automatisation : un ensemble d'étapes que Jenkins exécute en séquence, déclenché par un
+événement ou manuellement. Chaque job a sa propre config, son historique de builds, ses
+artefacts, ses logs.
+
+Deux familles principales :
+
+**Freestyle Project** : configuration **uniquement via l'UI web** Jenkins. On clique pour
+ajouter le SCM, des build steps (Execute shell, Invoke Gradle...), des post-actions, etc.
+Avantages : courbe d'apprentissage faible, idéal pour démarrer. Inconvénients : la config est
+stockée uniquement dans Jenkins (un dump XML), donc **non versionnée avec le code**. Si on
+perd le serveur Jenkins, on perd la définition du job. Difficile de faire de l'audit ou du
+rollback de la config.
+
+**Pipeline Project** : configuration via un **fichier `Jenkinsfile` versionné** dans le repo
+Git du projet (en Groovy DSL). C'est l'approche **Pipeline as Code**. Avantages : la config
+suit le code (chaque branche peut avoir son propre pipeline), revues en PR possibles,
+historique git, reproductibilité, possibilité de définir des stages en parallèle, de gérer des
+conditions complexes, etc. C'est la pratique recommandée en production.
+
+Pour un débutant, on commence avec un Freestyle pour comprendre le mécanisme, puis on passe
+rapidement à Pipeline pour les vrais projets.
+
+**Q16 — Pourquoi Jenkins est-il préféré en grande entreprise ?**
+
+Trois raisons principales :
+
+1. **Auto-hébergement et contrôle des données.** Les grandes entreprises (banques, défense,
+   santé, énergie) ont des contraintes réglementaires fortes : RGPD, PCI-DSS, HIPAA, ANSSI, etc.
+   Le code source et les credentials de production ne peuvent pas transiter par les serveurs
+   d'un tiers (GitHub, GitLab.com). Jenkins se déploie dans le datacenter interne, sur des VM
+   internes, derrière le firewall corporate.
+
+2. **Maturité et extensibilité.** L'écosystème de plugins Jenkins (1800+) couvre des cas
+   ultra-spécifiques : intégration avec mainframes IBM, outils de tests ServiceNow, bases
+   Oracle, déploiements sur F5 BIG-IP, etc. Sur les solutions cloud (GitHub Actions, GitLab
+   CI), ces intégrations exotiques manquent ou nécessitent du code custom.
+
+3. **Coût à l'échelle.** GitHub Actions facture par minute-runner. Pour une entreprise qui
+   fait 10 000 builds/mois × 30 min chacun, la facture grimpe vite (plusieurs k€/mois).
+   Jenkins sur des machines internes a un coût marginal nul après l'investissement initial. On
+   peut faire tourner 50 builds en parallèle sans surcoût.
+
+Autres raisons : interopérabilité avec n'importe quel SCM (pas verrouillé à GitHub),
+historique long (certaines entreprises ont 10+ ans de jobs Jenkins, migration vers autre chose
+= coût énorme), expertise interne disponible (anciens admins Jenkins formés depuis 2012),
+écosystème de support commercial (CloudBees vend du support Jenkins).
+
+**Q17 — Pourquoi monter un volume sur `/var/jenkins_home` ?**
+
+`/var/jenkins_home` est le **répertoire racine de toute la configuration Jenkins** :
+
+- Définitions des jobs (XML serialisé)
+- Comptes utilisateurs et permissions
+- Credentials (mots de passe, tokens API, clés SSH, etc., chiffrés via le master key Jenkins)
+- Historique des builds (logs, artefacts, durées, qui a déclenché quoi)
+- Plugins installés et leur config
+- Master key de chiffrement de Jenkins
+- Configuration globale (URL, SMTP, agents distants...)
+
+Sans volume persistant, **tout cela est dans le filesystem éphémère du conteneur**. À la
+moindre recreation du conteneur (`docker compose down && up`, mise à jour de l'image, crash et
+redémarrage), Jenkins repart **from scratch** : aucun job, aucun utilisateur, aucun
+credentials, aucun historique. Il faudrait tout reconfigurer manuellement. C'est inacceptable
+en production.
+
+Avec le volume nommé `jenkins-home` monté sur ce path, tout l'état Jenkins est stocké en
+dehors du conteneur (dans `/var/lib/docker/volumes/proshop-jenkins-home/_data` sur l'hôte).
+On peut détruire le conteneur, mettre à jour l'image vers une nouvelle version de Jenkins, le
+recréer avec le même volume — toute la config est conservée intacte.
+
+C'est aussi le bon endroit pour faire des sauvegardes : un `tar` du volume = backup complet
+de Jenkins (à faire à froid, conteneur stoppé). Pour restaurer dans un autre environnement,
+on extrait le tar dans un nouveau volume et on remonte le tout.
+

@@ -86,9 +86,40 @@ services:
       timeout: 5s
       retries: 3
 
+  # ───────────────────────────────────────────────────────────
+  #  Jenkins — serveur CI/CD.
+  #  Approche Docker-out-of-Docker (DooD) : on monte le socket
+  #  Docker de l'hôte dans le conteneur Jenkins, ce qui permet
+  #  à Jenkins de lancer `docker build` et `docker compose` en
+  #  utilisant le démon Docker de l'hôte (pas un démon imbriqué).
+  #
+  #  Le port 8080 est exposé pour accéder à l'UI Jenkins.
+  #  Le port 50000 est utilisé par les agents Jenkins (laissé
+  #  fermé pour l'instant — on travaille en mode "agent intégré").
+  # ───────────────────────────────────────────────────────────
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    container_name: proshop-jenkins
+    restart: unless-stopped
+    user: root            # nécessaire pour pouvoir lire /var/run/docker.sock
+    networks:
+      - proshop-net
+    ports:
+      - '8080:8080'
+    volumes:
+      - jenkins-home:/var/jenkins_home
+      # Socket Docker de l'hôte → Jenkins peut builder des images
+      # et invoquer docker compose sans installer son propre démon.
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Désactive l'écran de bienvenue post-install (optionnel)
+      JAVA_OPTS: '-Djenkins.install.runSetupWizard=true'
+
 volumes:
   mongo-data:
     name: proshop-mongo-data
+  jenkins-home:
+    name: proshop-jenkins-home
 
 networks:
   proshop-net:
