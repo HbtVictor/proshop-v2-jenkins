@@ -181,4 +181,124 @@ résolution doit attendre lundi si l'équipe n'a pas d'astreinte (= 60h de panne
 
 ---
 
-> _Sections P.2 à P.9 — à compléter au fil des étapes._
+## P.2 — Conteneurisation avec Docker
+
+### Fichiers livrés
+
+- `backend/Dockerfile` — image Node.js 20-alpine, multi-stage (deps install séparée du runtime),
+  port 5000, healthcheck via `wget`, exécution en user non-root `node`.
+- `frontend/Dockerfile` — multi-stage React : stage builder Node 20-alpine qui produit le bundle,
+  stage runtime Nginx 1.27-alpine qui sert les fichiers statiques. **L'image finale ne
+  contient pas Node.js du tout.**
+- `frontend/nginx.conf` — configuration interne Nginx pour le SPA React (fallback `index.html`).
+- `.dockerignore` à la racine — exclut `node_modules`, `.env`, `.git`, etc. du contexte de build.
+
+### Choix techniques justifiés
+
+1. **Base `alpine`** : 5-10 MB pour l'image de base contre 200+ MB pour `node:20`. Surface
+   d'attaque réduite (moins de packages = moins de CVE).
+2. **Multi-stage** : seules les dépendances de production atterrissent dans l'image finale
+   (option `--omit=dev` au `npm ci`). Côté frontend, on va plus loin : l'image finale ne contient
+   ni Node, ni `node_modules`, juste un Nginx avec le bundle statique compilé.
+3. **`COPY package*.json ./` AVANT `COPY . .`** : profite du cache layer Docker. Tant que les
+   manifests ne changent pas, le layer `npm ci` est réutilisé entre builds.
+4. **`USER node` / `USER nginx`** : exécution en user non-root (cf. Q7).
+5. **`HEALTHCHECK` intégré** : Docker peut détecter qu'un conteneur est en panne fonctionnelle
+   (et pas seulement crashé) — utile pour Compose `depends_on: condition: service_healthy`.
+6. **`EXPOSE` documentaire** : on documente le port ouvert dans l'image, sans publier
+   automatiquement vers l'extérieur (c'est Compose qui décide quoi publier).
+
+### Réponses Q5-Q8
+
+**Q5 — Image vs Conteneur (analogie)**
+
+Une **image** Docker est une **recette** figée : la liste d'instructions et le résultat
+binaire qui décrivent un état initial complet (filesystem, libs, variables d'env, commande de
+démarrage). Elle est en lecture seule, immutable, reproductible. On peut la stocker, la
+versionner, la pousser sur une registry.
+
+Un **conteneur** est une **instance vivante** d'une image : un processus en cours d'exécution
+sur le noyau hôte, isolé par des namespaces Linux. Il a son propre cycle de vie (created →
+running → stopped → removed), il peut accumuler des changements sur son filesystem (mais
+ceux-ci sont perdus à la suppression sauf si on a monté un volume).
+
+Analogie : l'image est le **plan d'un appartement** (architecte, immuable, dupliquable). Le
+conteneur est l'**appartement habité** (avec des meubles, des odeurs, des locataires qui
+entrent et sortent). À partir d'un même plan, on peut construire 1, 10 ou 1000 appartements
+identiques au départ qui divergeront par l'usage.
+
+**Q6 — Pourquoi séparer frontend / backend / DB en conteneurs distincts ?**
+
+Plusieurs raisons techniques et opérationnelles :
+
+1. **Scaling indépendant.** En cas de charge, on veut souvent 5 instances du backend et 1
+   instance du frontend (ou l'inverse). Si tout est dans un conteneur, on ne peut scaler que le
+   bloc entier — gâchis de RAM/CPU.
+
+2. **Mises à jour indépendantes.** On peut déployer un nouveau backend sans toucher au
+   frontend ni à la DB (rolling update, blue-green). Si tout est mélangé, chaque déploiement
+   redémarre tout, y compris la DB.
+
+3. **Sécurité par isolation.** Un compromis du frontend (XSS, dépendance npm vérolée) ne donne
+   pas accès au système de fichiers du backend ni à la DB. Avec un seul conteneur, c'est game
+   over à la première brèche.
+
+4. **Images officielles maintenues.** MongoDB a son image officielle, maintenue, patchée
+   contre les CVE. Si on installe MongoDB dans un conteneur Node, on doit gérer nous-mêmes
+   l'image — perte de temps et risque.
+
+5. **Cycle de vie différent.** La DB doit persister (volume monté). Le backend est
+   stateless et peut être recréé à volonté. Le frontend est complètement stateless. Mélanger
+   ces 3 cycles de vie est une mauvaise abstraction.
+
+6. **12-Factor App** : règle "treat backing services as attached resources" — la DB est une
+   ressource à laquelle l'app se connecte par URL, pas un sous-composant interne.
+
+**Q7 — Pourquoi ne pas exécuter un conteneur en root ?**
+
+Par défaut, le `USER` d'un Dockerfile est `root` (UID 0). Si on ne le change pas, le process
+dans le conteneur tourne en root sur le noyau hôte.
+
+Risque concret : **escalade de privilèges en cas d'évasion du conteneur**. Bien que Docker
+isole les conteneurs via des namespaces Linux, cette isolation a régulièrement des failles
+(historiquement : CVE-2019-5736 `runc breakout`, CVE-2022-0185, etc.). Si une faille permet à
+un attaquant de sortir du conteneur, et qu'il était root dedans, il est **root sur la machine
+hôte** — il peut lire `/etc/shadow`, modifier le kernel, déployer un rootkit, accéder aux
+autres conteneurs.
+
+Autre angle : même sans évasion, certaines opérations sont autorisées en root dans le
+conteneur (modifier les capabilities, monter des fichiers du host si `--privileged` est
+activé, etc.). Le principle of least privilege impose qu'un process n'ait que les permissions
+strictement nécessaires.
+
+Solution : `USER <non-root-user>` dans le Dockerfile. Les images officielles Node, Nginx, etc.
+fournissent un utilisateur dédié (`node`, `nginx`, UID 1000-101). Si on a besoin d'écrire dans
+un dossier, on chown ce dossier vers cet utilisateur dans le Dockerfile (`RUN chown -R
+node:node /app`).
+
+**Q8 — Pourquoi optimiser la taille des images Docker ?**
+
+- **Sécurité** : moins de packages installés = moins de surface d'attaque. Une image alpine
+  (5 MB de base) a 50× moins de paquets qu'une image Ubuntu (200+ MB). Statistiquement, moins
+  de CVE applicables. C'est l'argument numéro 1.
+
+- **Vitesse de déploiement** : pour mettre à jour un service, chaque nœud du cluster doit
+  pull la nouvelle image. Sur 10 nœuds avec une image de 500 MB sur une connexion 100 Mbps, on
+  parle de plusieurs dizaines de secondes de cumul. Avec une image de 80 MB, c'est instantané.
+  Sur un déploiement multi-régions ou edge (CDN à plusieurs PoPs), l'impact est multiplié.
+
+- **Coûts d'infrastructure** : les registries (Docker Hub, GHCR, ECR) facturent au volume
+  stocké et au transfert. Une image divisée par 5, c'est aussi 5× moins de coût de bande
+  passante quand 1000 nœuds la pull en parallèle.
+
+- **Démarrage à froid plus rapide** : sur Kubernetes ou en serverless containers (AWS Fargate,
+  Google Cloud Run), le temps de "cold start" inclut le download de l'image. Une image de 80
+  MB démarre 5× plus vite qu'une de 500 MB.
+
+- **Lisibilité et maintenabilité** : un Dockerfile court et optimisé est plus simple à
+  auditer. On voit immédiatement ce qui est dans l'image. Une image énorme cache souvent une
+  accumulation historique non nettoyée.
+
+Techniques d'optimisation appliquées dans ce TP : base `alpine`, multi-stage, `--omit=dev`,
+`.dockerignore`, ordre des `COPY` pour le cache layer.
+
