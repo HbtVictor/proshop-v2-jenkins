@@ -429,3 +429,115 @@ En pratique : créer un réseau dédié coûte 0 (un seul `networks:` block dans
 apporte une isolation, un DNS propre et une lisibilité réelles. C'est la pratique standard
 pour toute stack multi-conteneurs.
 
+---
+
+## P.4 — Reverse Proxy avec Nginx
+
+### Fichiers livrés
+
+- `nginx/nginx.conf` — configuration du reverse proxy : 3 `location` (`/api/`, `/uploads/`,
+  `/`), 3 `upstream` (frontend, backend), headers `Host`, `X-Real-IP`, `X-Forwarded-For`,
+  `X-Forwarded-Proto`.
+- `docker-compose.yml` mis à jour — service `proxy` (image `nginx:1.27-alpine`) qui monte
+  `./nginx/nginx.conf` en read-only. **Les `ports:` des services frontend et backend ont été
+  supprimés** : ils ne sont plus joignables que depuis le réseau Docker interne.
+
+### Architecture après P.4
+
+```
+   internet / localhost
+            │
+            ▼ port 80 (seul port public)
+   ┌─────────────────────────┐
+   │   proshop-proxy         │
+   │   (nginx:1.27-alpine)   │
+   └────┬─────────┬──────────┘
+        │         │
+   /    │         │  /api/* + /uploads/*
+        ▼         ▼
+   ┌────────┐  ┌────────┐  ┌────────┐
+   │frontend│  │backend │──▶ mongo  │
+   └────────┘  └────────┘  └────────┘
+   (3000)      (5000)        (27017)
+   non publié  non publié    non publié
+```
+
+Plus rien n'est exposé à l'extérieur sauf le port 80 du proxy.
+
+### Vérification
+
+Depuis l'extérieur de la stack Docker :
+
+| URL                                 | Statut | Comportement attendu                       |
+| ----------------------------------- | ------ | ------------------------------------------ |
+| `http://127.0.0.1/`                 | 200    | Bundle React (frontend) servi via Nginx    |
+| `http://127.0.0.1/api/products`     | 200    | JSON des 6 produits seedés (backend)       |
+| `http://127.0.0.1/images/airpods.jpg` | 200    | Image produit (servie par frontend public/) |
+| `http://127.0.0.1:3000`             | refus  | Frontend non publié                        |
+| `http://127.0.0.1:5000`             | refus  | Backend non publié                         |
+| `http://127.0.0.1:27017`            | refus  | Mongo non publié                           |
+
+### Réponses Q12-Q13
+
+**Q12 — Pourquoi utiliser un reverse proxy ?**
+
+Quatre bénéfices distincts :
+
+1. **Point d'entrée unique** = surface d'attaque réduite. Un seul port (80) à exposer au monde
+   extérieur, donc une seule porte à protéger (firewall, WAF, rate limiting). Sans reverse
+   proxy, il faudrait exposer 3 ports différents (frontend 3000, backend 5000, plus tard
+   potentiellement metrics 9090, etc.), chacun étant une surface d'attaque indépendante.
+
+2. **Abstraction de l'architecture interne**. Côté client (navigateur), il n'y a qu'**une**
+   origine : `https://shop.mondomaine.com`. Le client ignore qu'en interne, l'API est sur un
+   conteneur Node et le frontend sur Nginx avec un bundle React. Si demain on remplace le
+   backend Node par du Go, ou si on splitte le frontend en micro-front-ends, **le client ne
+   change pas une ligne**.
+
+3. **Terminaison TLS centralisée**. C'est sur le reverse proxy qu'on installe le certificat
+   HTTPS (Let's Encrypt, etc.). Les conteneurs internes peuvent rester en HTTP simple (réseau
+   Docker isolé). Sans reverse proxy, il faudrait gérer le TLS dans chaque service — duplication
+   de config, certificats à renouveler partout, et certains services (Node natif) gèrent mal
+   TLS.
+
+4. **Cross-cutting concerns** centralisés : logs d'accès unifiés, compression gzip, cache HTTP,
+   rate limiting, blocage géo-IP, redirection HTTP→HTTPS, headers de sécurité (CSP, HSTS,
+   X-Frame-Options). Ces fonctions sont implémentées **une fois** dans Nginx et s'appliquent à
+   tous les services en aval.
+
+Bénéfices supplémentaires : load balancing (si on a 3 instances backend, Nginx round-robin),
+maintenance window (on peut router vers une page de maintenance le temps d'un déploiement),
+CORS (gérer les en-têtes Origin proprement).
+
+**Q13 — Proxy vs Reverse Proxy**
+
+Les deux relaient des requêtes HTTP, mais dans des directions opposées et pour des publics
+différents.
+
+**Proxy (forward proxy)** : se place **devant les clients**. Le client envoie sa requête au
+proxy, qui la transmet au serveur web. Le serveur ne voit que l'IP du proxy.
+- Cas d'usage : un proxy d'entreprise sur le réseau interne (Squid) qui filtre les requêtes
+  sortantes des employés vers Internet (bloque les sites adultes, journalise les accès,
+  applique le filtrage selon des règles RH/sécurité). Autre exemple : un VPN qui agit comme
+  proxy pour anonymiser le trafic d'un utilisateur.
+
+**Reverse proxy** : se place **devant les serveurs**. Le client envoie sa requête au reverse
+proxy, qui décide à quel serveur interne la transmettre. Le client ignore que des serveurs
+existent derrière.
+- Cas d'usage : notre Nginx ProShop. Autre exemple : Cloudflare, qui agit comme reverse proxy
+  géant devant des millions de sites web — il termine le TLS, applique un WAF, sert un cache
+  CDN, puis transmet aux serveurs d'origine.
+
+Schéma résumé :
+
+```
+FORWARD PROXY :     [Client] → [Proxy] → [Internet] → [Serveur web]
+                    (Le proxy protège/contrôle le client)
+
+REVERSE PROXY :    [Internet] → [Reverse Proxy] → [Serveur(s) internes]
+                                (Le proxy protège/oriente les serveurs)
+```
+
+Dans les deux cas, c'est exactement le **même logiciel** qui peut faire l'un ou l'autre
+(Nginx, HAProxy, Traefik...). C'est la position dans l'architecture qui définit le rôle.
+
