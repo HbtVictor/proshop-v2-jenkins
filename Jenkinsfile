@@ -1,49 +1,52 @@
 // ═══════════════════════════════════════════════════════════════
-//  Jenkinsfile — Pipeline CI/CD complet ProShop v2 (Partie 7).
+//  Jenkinsfile — Pipeline CI/CD complet ProShop v2 (Parties 7 + 8).
 //
-//  7 stages :
+//  8 stages :
 //    1. Checkout       — recup du code
 //    2. Install        — npm ci backend + frontend
 //    3. Lint           — ESLint backend (--max-warnings=0)
 //    4. Test           — smoke test integrite + JSON valide
-//    5. Build Docker   — build images backend + frontend
-//    6. Deploy         — docker compose up -d  (uniquement main)
-//    7. Health Check   — attend que /api/health repond 200 (retry)
+//    5. Build Docker   — build images backend + frontend (tags v1.0, latest, ci-N)
+//    6. Push GHCR      — login + push vers ghcr.io (uniquement main)
+//    7. Deploy         — docker compose up -d  (uniquement main)
+//    8. Health Check   — attend que /api/health repond 200 (retry)
 //
 //  Declenchement :
-//    - Poll SCM toutes les 2 min (config dans le job Jenkins UI)
-//    - workflow_dispatch / Build Now manuel
+//    - Poll SCM toutes les 2 min (Q24 : webhook non possible en local)
+//    - Build Now manuel
 //
-//  Pourquoi pas un vrai webhook GitHub ?
-//    Jenkins tourne en local (127.0.0.1:8080). GitHub ne peut pas
-//    l'atteindre depuis Internet sans ngrok / Cloudflare Tunnel.
-//    On utilise donc Poll SCM (Jenkins demande "y a-t-il du neuf
-//    sur main ?" a Git toutes les 2 minutes). Voir Q24.
+//  Strategie de tagging (Partie 8) :
+//    - ci-${BUILD_NUMBER} : tag unique par build CI (utile pour debug)
+//    - ${APP_VERSION}     : tag de version immuable (ex: v1.0)
+//    - latest             : tag mouvant (toujours = derniere release main)
 // ═══════════════════════════════════════════════════════════════
 
 pipeline {
   agent any
 
   environment {
-    NODE_ENV  = 'production'
-    APP_NAME  = 'proshop-v2'
-    // Tag de l'image que le pipeline produit. BUILD_NUMBER croit a
-    // chaque execution → tag unique et reproductible par build.
-    IMG_TAG_BACKEND  = "proshop-backend:ci-${env.BUILD_NUMBER}"
-    IMG_TAG_FRONTEND = "proshop-frontend:ci-${env.BUILD_NUMBER}"
+    NODE_ENV     = 'production'
+    APP_NAME     = 'proshop-v2'
+    APP_VERSION  = 'v1.0'
+
+    // GHCR registry — l'image est lowercase (requis par GHCR)
+    REGISTRY     = 'ghcr.io'
+    GHCR_OWNER   = 'hbtvictor'
+
+    // Tags Docker locaux (referencent l'image apres build, avant push)
+    IMG_BACKEND_BASE  = "${REGISTRY}/${GHCR_OWNER}/proshop-backend"
+    IMG_FRONTEND_BASE = "${REGISTRY}/${GHCR_OWNER}/proshop-frontend"
+    IMG_BACKEND_CI    = "${IMG_BACKEND_BASE}:ci-${env.BUILD_NUMBER}"
+    IMG_FRONTEND_CI   = "${IMG_FRONTEND_BASE}:ci-${env.BUILD_NUMBER}"
   }
 
   options {
     buildDiscarder(logRotator(numToKeepStr: '10'))
     timeout(time: 45, unit: 'MINUTES')
     timestamps()
-    // Empeche un meme job de lancer 2 builds en parallele.
     disableConcurrentBuilds()
   }
 
-  // Declenchement automatique : Poll SCM toutes les 2 minutes.
-  // (Egalement configurable dans la UI du job, mais le mettre ici
-  //  rend le trigger versione avec le code.)
   triggers {
     pollSCM('H/2 * * * *')
   }
@@ -53,7 +56,7 @@ pipeline {
     // ─── Stage 1 : Checkout ───────────────────────────────────
     stage('Checkout') {
       steps {
-        echo "[Stage 1/7] Checkout"
+        echo "[Stage 1/8] Checkout"
         checkout scm
         sh 'git log --oneline -3'
       }
@@ -62,11 +65,7 @@ pipeline {
     // ─── Stage 2 : Install ────────────────────────────────────
     stage('Install') {
       steps {
-        echo "[Stage 2/7] Install dependencies"
-        // --include=dev force l'install des devDependencies meme quand
-        // NODE_ENV=production est defini dans l'environment du pipeline
-        // (sinon npm les ignore et eslint n'est pas installe → stage Lint
-        // echoue avec 'eslint: not found').
+        echo "[Stage 2/8] Install dependencies"
         sh 'npm ci --include=dev'
         sh 'npm ci --include=dev --prefix frontend'
       }
@@ -75,7 +74,7 @@ pipeline {
     // ─── Stage 3 : Lint ────────────────────────────────────────
     stage('Lint') {
       steps {
-        echo "[Stage 3/7] ESLint backend"
+        echo "[Stage 3/8] ESLint backend"
         sh 'npm run lint'
       }
     }
@@ -83,11 +82,7 @@ pipeline {
     // ─── Stage 4 : Test ────────────────────────────────────────
     stage('Test') {
       steps {
-        echo "[Stage 4/7] Smoke tests"
-        // Le repo upstream n'a pas de tests Jest configures cote backend.
-        // On fait un smoke test : verif des fichiers cles + JSON valide
-        // + verif que le serveur Express demarre sans crash sur
-        // l'import de tous les modules.
+        echo "[Stage 4/8] Smoke tests"
         sh '''
           test -f backend/server.js || (echo "MISSING backend/server.js" && exit 1)
           test -f frontend/package.json || (echo "MISSING frontend/package.json" && exit 1)
@@ -98,49 +93,80 @@ pipeline {
       }
     }
 
-    // ─── Stage 5 : Build Docker ───────────────────────────────
+    // ─── Stage 5 : Build Docker + tagging ──────────────────────
+    //  On build chaque image une fois, puis on ajoute plusieurs tags :
+    //    - ci-${BUILD_NUMBER} (unique par build)
+    //    - ${APP_VERSION}     (ex: v1.0)
+    //    - latest             (mouvant — toujours la derniere)
     stage('Build Docker') {
       steps {
-        echo "[Stage 5/7] Build images backend + frontend"
-        sh 'docker build -t $IMG_TAG_BACKEND -f backend/Dockerfile .'
-        sh 'docker build -t $IMG_TAG_FRONTEND -f frontend/Dockerfile ./frontend'
-        sh 'docker images | grep proshop | head -10'
+        echo "[Stage 5/8] Build images + multi-tag"
+        sh '''
+          docker build -t ${IMG_BACKEND_CI} -f backend/Dockerfile .
+          docker tag ${IMG_BACKEND_CI} ${IMG_BACKEND_BASE}:${APP_VERSION}
+          docker tag ${IMG_BACKEND_CI} ${IMG_BACKEND_BASE}:latest
+
+          docker build -t ${IMG_FRONTEND_CI} -f frontend/Dockerfile ./frontend
+          docker tag ${IMG_FRONTEND_CI} ${IMG_FRONTEND_BASE}:${APP_VERSION}
+          docker tag ${IMG_FRONTEND_CI} ${IMG_FRONTEND_BASE}:latest
+
+          docker images | grep -E "proshop-(backend|frontend)" | head -10
+        '''
       }
     }
 
-    // ─── Stage 6 : Deploy ──────────────────────────────────────
-    //  Uniquement sur main — protection via `when { branch 'main' }`.
-    //  On utilise --no-deps pour ne PAS redeployer jenkins lui-meme
-    //  (sinon le conteneur Jenkins se redemarre en plein milieu du
-    //  pipeline et tue l'execution).
+    // ─── Stage 6 : Push GHCR ───────────────────────────────────
+    //  Uniquement sur main. Utilise un credential Jenkins de type
+    //  "Username with password" — l'username GitHub + un PAT
+    //  (scope write:packages). Le PAT n'apparait JAMAIS dans les logs.
+    stage('Push GHCR') {
+      when {
+        branch 'main'
+      }
+      steps {
+        echo "[Stage 6/8] Push images vers ${REGISTRY}"
+        withCredentials([usernamePassword(
+            credentialsId: 'ghcr-credentials',
+            usernameVariable: 'GHCR_USER',
+            passwordVariable: 'GHCR_TOKEN')]) {
+          // login via stdin pour ne pas exposer le token sur la ligne de commande
+          sh '''
+            echo "$GHCR_TOKEN" | docker login ${REGISTRY} -u "$GHCR_USER" --password-stdin
+            docker push ${IMG_BACKEND_BASE}:${APP_VERSION}
+            docker push ${IMG_BACKEND_BASE}:latest
+            docker push ${IMG_FRONTEND_BASE}:${APP_VERSION}
+            docker push ${IMG_FRONTEND_BASE}:latest
+            docker logout ${REGISTRY}
+          '''
+        }
+      }
+    }
+
+    // ─── Stage 7 : Deploy ──────────────────────────────────────
     stage('Deploy') {
       when {
         branch 'main'
       }
       steps {
-        echo "[Stage 6/7] Deploy via docker compose"
-        // On tague d'abord les images avec :local (le tag attendu par
-        // docker-compose.yml) puis on lance up -d --no-deps.
+        echo "[Stage 7/8] Deploy via docker compose"
+        // On tague les images avec :local (attendu par docker-compose.yml)
+        // puis on lance up -d --no-deps (sans toucher a Jenkins).
         sh '''
-          docker tag $IMG_TAG_BACKEND proshop-backend:local
-          docker tag $IMG_TAG_FRONTEND proshop-frontend:local
+          docker tag ${IMG_BACKEND_BASE}:${APP_VERSION} proshop-backend:local
+          docker tag ${IMG_FRONTEND_BASE}:${APP_VERSION} proshop-frontend:local
           docker compose up -d --no-deps mongo backend frontend proxy
         '''
         sh 'docker compose ps'
       }
     }
 
-    // ─── Stage 7 : Health Check ───────────────────────────────
-    //  Attend que /api/health (a travers Nginx) reponde 200.
-    //  retry(6) avec sleep 5s entre tentatives → 30s max.
+    // ─── Stage 8 : Health Check ───────────────────────────────
     stage('Health Check') {
       when {
         branch 'main'
       }
       steps {
-        echo "[Stage 7/7] Health check via proxy"
-        // Jenkins est sur le meme reseau Docker `proshop-net`, donc
-        // il atteint le proxy par son nom de service `proxy`.
+        echo "[Stage 8/8] Health check via proxy"
         retry(6) {
           sh '''
             sleep 5
@@ -155,18 +181,17 @@ pipeline {
 
   post {
     success {
-      echo "Pipeline OK — build #${BUILD_NUMBER} reussi"
+      echo "Pipeline OK — build #${BUILD_NUMBER} (${APP_VERSION})"
     }
     failure {
       echo "Pipeline ECHOUE au stage : ${STAGE_NAME ?: '?'}"
     }
     always {
-      echo "Pipeline termine (succes ou echec)"
-      // Nettoyage : on supprime les images taguees ci-XXX pour ne pas
-      // accumuler — sauf si on les a deja taguees :local (deploiement).
-      // `|| true` pour ne pas faire echouer le post-action.
-      sh 'docker rmi $IMG_TAG_BACKEND 2>/dev/null || true'
-      sh 'docker rmi $IMG_TAG_FRONTEND 2>/dev/null || true'
+      echo "Pipeline termine — nettoyage des tags ci-${BUILD_NUMBER}"
+      // On supprime UNIQUEMENT les tags ci-N (specifiques au build),
+      // pas les tags v1.0/latest qui doivent rester pour le deploiement.
+      sh 'docker rmi ${IMG_BACKEND_CI} 2>/dev/null || true'
+      sh 'docker rmi ${IMG_FRONTEND_CI} 2>/dev/null || true'
     }
   }
 }

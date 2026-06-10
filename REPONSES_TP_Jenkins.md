@@ -1163,3 +1163,134 @@ Blue Ocean reportent typiquement une réduction du temps de diagnostic d'inciden
 immédiatement où ça a foiré) et une meilleure adoption par les profils non-DevOps (frontend
 devs, QA, etc.) qui n'aimaient pas l'UI classique.
 
+---
+
+## P.8 — Tagging Docker
+
+### Stratégie de tagging mise en place
+
+Le pipeline Jenkins (stage **Build Docker** + stage **Push GHCR**) produit **trois tags**
+pour chaque image (backend et frontend) à chaque build sur `main` :
+
+| Tag                    | Type        | Mutabilité | Cas d'usage                              |
+| ---------------------- | ----------- | ---------- | ---------------------------------------- |
+| `ci-${BUILD_NUMBER}`   | technique   | immuable   | Debug interne / traçabilité build Jenkins |
+| `v1.0`                 | release     | immuable   | Déploiement production reproductible     |
+| `latest`               | rolling     | mouvante   | Démo / docs / dev                        |
+
+Les images sont poussées sur **GHCR** (`ghcr.io/hbtvictor/proshop-backend` et
+`ghcr.io/hbtvictor/proshop-frontend`).
+
+### Credentials Jenkins
+
+Conformément à Q23, le PAT GitHub (scope `write:packages`) est stocké dans Jenkins via
+**Manage Jenkins → Credentials → System → Global** :
+- Kind : `Username with password`
+- Scope : Global
+- Username : `HbtVictor`
+- Password : `ghp_...` (PAT GitHub, jamais dans le code)
+- ID : `ghcr-credentials`
+
+Le pipeline y accède via `withCredentials([usernamePassword(credentialsId: 'ghcr-credentials', ...)])`,
+ce qui rend les variables `GHCR_USER` et `GHCR_TOKEN` disponibles uniquement dans le bloc.
+Jenkins masque automatiquement le PAT dans les logs (`****`).
+
+### Procédure de rollback documentée
+
+Voir [`JENKINS_DEPLOYMENT.md`](./JENKINS_DEPLOYMENT.md) section "Procédure de rollback" pour
+les 3 scénarios de rollback détaillés (rollback local urgent < 2 min, rollback définitif via
+git revert, rollback vers un build CI spécifique).
+
+### Réponses Q27-Q28
+
+**Q27 — Pourquoi versionner les images Docker ?**
+
+Versionner les images Docker = produire un tag **immuable et reproductible** pour chaque
+version stable de l'application. Concrètement, on construit une image et on lui attribue un
+tag comme `v1.2.3` qui ne sera **jamais** réutilisé pour une autre image.
+
+**Bénéfices** :
+
+1. **Reproductibilité** : `docker pull monapp:v1.2.3` retourne exactement la même image
+   aujourd'hui que dans 6 mois. Le SHA256 ne change pas. C'est essentiel pour rejouer un build
+   précis en cas d'investigation post-incident.
+
+2. **Rollback rapide et fiable** : si `v1.3.0` est cassée, on déploie `v1.2.3` en une
+   commande. On est sûr de retomber exactement sur le comportement précédent — pas une variante
+   "à peu près similaire".
+
+3. **Multi-environnement** : staging tourne en `v1.3.0-rc1`, production en `v1.2.3`. On peut
+   tester explicitement la version avant de la propager. Sans tags fixes, "staging et prod
+   tournent la même version" est une affirmation invérifiable.
+
+4. **Audit et traçabilité** : un ticket support "le bug est en production depuis le 12 juin"
+   peut être croisé avec "v1.2.4 a été déployée le 11 juin" → on identifie le commit en cause
+   en quelques minutes.
+
+5. **Sécurité** : un scanner Trivy / Snyk peut être tagué sur des versions spécifiques. On
+   peut dire "v1.2.3 a des vulnérabilités HIGH connues, v1.2.4 les corrige" — base d'un plan
+   de patching.
+
+**Limites du tag `:latest` utilisé seul** :
+
+`:latest` est juste un **pointeur mouvant**. Il ne contient pas d'information de version. Les
+problèmes :
+
+- **Imprédictible** : qui sait quelle image est sur `:latest` ? Celle pushée il y a 5
+  minutes ? Hier ? La semaine dernière ? Personne ne peut le dire sans aller voir l'historique
+  de la registry.
+- **Caching d'images** : un nœud Kubernetes peut avoir une vieille image `:latest` en cache
+  local et continuer à l'utiliser même si une nouvelle a été pushée. Sans `imagePullPolicy:
+  Always`, on ne rejoue jamais le pull → "tu as déployé la nouvelle version ?" "Oui" "Mais
+  les logs montrent l'ancienne…".
+- **Rollback impossible** : `:latest` est par définition la dernière version. Si la dernière
+  est cassée, il n'y a pas de "version d'avant `:latest`" — il faut connaître `:v1.2.3`
+  pour rollback.
+- **Pas d'historique** : on ne peut pas dire "qu'est-ce qui tournait en prod le 12 juin à
+  14h ?" — `:latest` à cette date n'existe plus, il a été écrasé.
+
+`:latest` est utile pour les démos publiques et la doc ("essayez `docker run monapp:latest`")
+mais **ne doit jamais être l'unique tag** d'un environnement productif.
+
+**Q28 — Risque de déployer en prod avec `:latest` uniquement**
+
+Scénario concret d'incident :
+
+> 16h30 vendredi. Le dev pousse un commit "fix: refactor petite chose" sur main. Le pipeline
+> CI/CD se déclenche, push l'image taguée `:latest` sur la registry. La prod est configurée
+> avec `image: proshop-backend:latest` et `imagePullPolicy: Always`. Le déploiement automatique
+> redéploie la nouvelle image. Tout est encore vert dans le monitoring (le health check
+> répond 200).
+>
+> 18h00. Le pic d'affluence du vendredi soir arrive. Sous charge, le "petit refactor" provoque
+> un memory leak. Les pods commencent à crasher. Le système d'auto-scaling tente de monter de
+> nouveaux pods qui crashent à leur tour. Les utilisateurs voient des 502.
+>
+> 18h15. L'astreinte est appelée. Le dev qui a poussé est parti en weekend. Le tech lead
+> arrive, identifie que ça a commencé après 16h30. Il regarde l'historique CI → "ah, il y a eu
+> un build à 16h30, peut-être lié ?". Mais il ne sait pas **quelle image** était sur `:latest`
+> avant ce build (elle a été écrasée), ni s'il faut rebuild un commit précédent ou pull une
+> image qui existerait encore quelque part.
+>
+> 18h30. Il décide de revert le commit fautif sur main et de pousser. Le pipeline CI tourne
+> pour 8 minutes. Au final, il a fallu **2 heures** pour rétablir le service.
+>
+> 19h00. Service rétabli. Bilan : 90 minutes de panne en plein pic du vendredi soir, ~10K€
+> de chiffre d'affaires perdu, des avis Trustpilot négatifs, et le tech lead a passé sa
+> soirée à débugger.
+
+**Avec un tagging propre `v1.2.3` + `latest`** :
+
+À 18h15, le tech lead aurait pu faire :
+```bash
+docker pull ghcr.io/.../proshop-backend:v1.2.2  # version précédente immuable
+docker tag ghcr.io/.../proshop-backend:v1.2.2 ghcr.io/.../proshop-backend:latest
+kubectl rollout restart deployment/backend
+```
+
+Service rétabli en **< 5 minutes**. Sans tag de version, c'est mathématiquement impossible.
+
+C'est pour ça que toutes les pipelines de production sérieuses publient au minimum 2 tags
+par release : un immuable (`vX.Y.Z`) ET un alias rolling (`latest`), et que les manifests
+de déploiement référencent **toujours** le tag immuable.
+
