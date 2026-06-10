@@ -1294,3 +1294,233 @@ C'est pour ça que toutes les pipelines de production sérieuses publient au min
 par release : un immuable (`vX.Y.Z`) ET un alias rolling (`latest`), et que les manifests
 de déploiement référencent **toujours** le tag immuable.
 
+---
+
+## P.9 — Production : déploiement, panne, rollback
+
+### Tests fonctionnels après déploiement par le pipeline
+
+Après le build Jenkins #N qui a déployé via Compose, les tests suivants ont été effectués :
+
+| Test                                          | Résultat                                                |
+| --------------------------------------------- | ------------------------------------------------------- |
+| `GET http://127.0.0.1/` (frontend)            | HTTP 200, bundle React servi via Nginx                  |
+| `GET http://127.0.0.1/api/health`             | HTTP 200, `{status:'ok', timestamp:...}`                |
+| `GET http://127.0.0.1/api/products`           | HTTP 200, JSON des 6 produits seedés                    |
+| Navigation frontend → catalogue produits      | OK, les 6 produits s'affichent avec images              |
+| Connexion utilisateur (admin@email.com)       | OK (creds créés par le seeder)                          |
+| Persistance MongoDB (down + up backend)       | OK, données intactes (volume `proshop-mongo-data`)      |
+
+### Simulation de panne backend (P.9 point 3)
+
+Procédure exécutée :
+
+```bash
+# 1. État de départ
+curl http://127.0.0.1/api/health   # → 200 {status: 'ok'}
+
+# 2. Arrêt brutal du backend (simulation crash applicatif)
+docker stop proshop-backend
+
+# 3. Observation du comportement
+curl http://127.0.0.1/                # → 200 (frontend OK, Nginx sert le bundle statique)
+curl http://127.0.0.1/api/health      # → 504 Gateway Timeout (puis 502 Bad Gateway)
+curl http://127.0.0.1/api/products    # → 502 Bad Gateway
+
+docker logs proshop-proxy --tail 5
+# → 2026/06/10 08:31:34 [error] *33 connect() failed (113: Host is unreachable)
+#    while connecting to upstream: http://172.21.0.4:5000/api/products
+```
+
+**Observations** :
+
+- **Le frontend continue de fonctionner** parce qu'il est servi statiquement par le conteneur
+  frontend (Nginx interne) — indépendant du backend.
+- **Les routes `/api/*` retournent 502 Bad Gateway** : Nginx ne peut pas atteindre le backend,
+  il génère une page d'erreur 502 standard.
+- **Les logs Nginx sont explicites** : `connect() failed (113: Host is unreachable)` avec
+  l'URL upstream complète. Permet de diagnostiquer en 5 secondes "le backend est down".
+- **MongoDB et Jenkins continuent de tourner** : la panne est isolée au service en cause.
+
+### Récupération
+
+```bash
+docker start proshop-backend
+# → ~10 secondes plus tard :
+curl http://127.0.0.1/api/health    # → 200 {status: 'ok'}
+```
+
+Temps total de récupération : **~11 secondes** (entre `docker start` et `/api/health 200`).
+Aucune perte de données : le volume MongoDB est resté monté tout du long.
+
+### Procédure de rollback vers v1.0
+
+Voir [`JENKINS_DEPLOYMENT.md`](./JENKINS_DEPLOYMENT.md) section "Procédure de rollback" pour
+les 3 scénarios complets. Le scénario d'urgence ("v1.1 cassée → revenir à v1.0 en < 5 min") :
+
+```bash
+# 1. Stopper les services applicatifs (sans toucher à MongoDB ni Jenkins)
+docker compose stop backend frontend proxy
+
+# 2. Re-taguer les images v1.0 (déjà sur GHCR) comme :local
+docker tag ghcr.io/hbtvictor/proshop-backend:v1.0 proshop-backend:local
+docker tag ghcr.io/hbtvictor/proshop-frontend:v1.0 proshop-frontend:local
+
+# 3. Redémarrer la stack avec les images stables
+docker compose up -d --no-deps backend frontend proxy
+
+# 4. Vérifier
+curl http://127.0.0.1/api/health
+```
+
+**Durée mesurée** : 3-4 minutes (incluant pull si les images ne sont pas en cache local).
+Critère du PDF (< 5 minutes) respecté.
+
+### Réponses Q29-Q31
+
+**Q29 — Différence Dev / Staging / Production**
+
+Chacun a un rôle distinct et complémentaire dans le cycle de vie du logiciel :
+
+**Dev (Développement)** : environnement personnel du développeur, sur sa machine.
+- **Données** : données factices, base locale (peut être détruite à volonté).
+- **Stabilité** : aucune attendue — l'app crash régulièrement parce qu'on code dessus.
+- **Public** : un seul développeur (parfois quelques-uns qui partagent un dev shared).
+- **Cycle de vie** : redéployé en continu via `npm run dev`, hot-reload activé.
+- **Objectif** : itérer rapidement, expérimenter, debug.
+
+**Staging** : environnement **iso-prod** où on valide une release candidate.
+- **Données** : copie anonymisée de la prod ou data set de qualification représentatif.
+- **Stabilité** : critique — un staging instable empêche de valider les releases.
+- **Public** : l'équipe (QA, product owner, parfois client interne).
+- **Cycle de vie** : déployé à chaque merge sur `main`, après les tests CI.
+- **Objectif** : valider qu'une nouvelle version fonctionne en conditions réelles **avant**
+  de la mettre en production.
+
+**Production** : environnement live, utilisé par les vrais clients.
+- **Données** : données réelles, sensibles, à protéger absolument.
+- **Stabilité** : maximale (SLA 99.9% ou plus).
+- **Public** : utilisateurs finaux, des milliers à millions de clients.
+- **Cycle de vie** : déployé uniquement après validation staging + approbation manuelle.
+- **Objectif** : servir les utilisateurs sans interruption ni dégradation.
+
+Les trois environnements doivent être **identiques au niveau infrastructure** (même version
+de Node, mêmes images Docker, même config Nginx, etc.). Seules les variables d'env (URI DB,
+clés API, secrets) diffèrent. Cette iso-prod est la clé d'un bon staging : si staging est
+légèrement différent, il ne détecte pas tous les bugs.
+
+**Q30 — Pourquoi prévoir un plan de rollback ?**
+
+Un plan de rollback est une **assurance** : la possibilité de revenir rapidement à un état
+fonctionnel connu en cas d'incident. C'est une compétence opérationnelle, pas seulement
+technique.
+
+**Pourquoi systématiquement le prévoir** :
+
+1. **Murphy's Law** : à un moment, un déploiement va casser quelque chose qui n'avait pas été
+   testé. Sans plan de rollback préparé à froid, on improvise dans la panique — recette pour
+   aggraver l'incident.
+2. **Temps de résolution divisé par 10** : un rollback documenté prend 3-5 minutes. Sans, on
+   peut perdre 1-2 heures à diagnostiquer + débugger + déployer un patch.
+3. **Confiance pour déployer** : si on sait qu'on peut rollback en 5 min, on déploie plus
+   souvent (deploy-on-Friday OK !). Sans rollback, chaque déploiement est anxiogène, on les
+   espace, on accumule des risques.
+4. **Réversibilité = liberté d'expérimenter** : on peut tester des features risquées en
+   staging puis prod, sachant qu'on peut revenir si besoin. C'est la base du déploiement
+   progressif (canary, blue-green).
+
+**Scénario réel où le rollback est la bonne décision** :
+
+> Mardi 14h, on déploie `v2.3.0` qui contient une refacto de l'ORM. À 14h30, le monitoring
+> signale que la latence p95 des requêtes a doublé (passée de 200ms à 400ms). Le P50 est
+> normal. À 14h45, les premiers tickets support arrivent : "le panier prend du temps à charger".
+> Le tech lead doit décider en 5 minutes :
+>
+> **Option A** : Investiguer le code pour identifier la régression de performance. Estimation :
+> 2-4 heures (analyse query plan, comparaison des EXPLAIN PostgreSQL, identifier la requête
+> N+1, écrire le fix, tester, déployer).
+>
+> **Option B** : Rollback vers `v2.2.5` (version d'hier, stable). Estimation : 5 minutes.
+>
+> Le bon choix est **B**. On rollback, on stabilise le service immédiatement. Ensuite, on
+> investigue à froid, sans pression, et on prépare un patch `v2.3.1` qu'on déploiera
+> correctement quand on aura compris.
+>
+> Le rollback n'est pas un aveu d'échec — c'est une décision opérationnelle saine qui protège
+> les utilisateurs.
+
+**Q31 — Diagnostiquer une panne backend avec les outils du TP**
+
+Démarche en escalade (du plus rapide au plus profond) :
+
+**Étape 1 — Vérifier l'état des conteneurs** (10 secondes)
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}"
+```
+Si `proshop-backend` est absent ou `Exited`, on a la cause de premier niveau : le conteneur
+ne tourne pas. Si tous sont `Up`, on creuse plus loin.
+
+**Étape 2 — Tester l'endpoint depuis l'extérieur** (10 secondes)
+```bash
+curl http://127.0.0.1/api/health      # via Nginx
+curl http://127.0.0.1/api/products    # endpoint applicatif réel
+```
+Codes possibles :
+- **200** : tout va bien, c'est peut-être un problème côté client.
+- **502 Bad Gateway** : Nginx ne peut pas atteindre le backend (backend down ou réseau Docker
+  cassé).
+- **504 Gateway Timeout** : Nginx atteint le backend mais celui-ci ne répond pas dans le délai
+  (backend bloqué sur une requête longue, deadlock, surcharge).
+- **500** : backend démarre mais throws une exception (le code lui-même est cassé).
+
+**Étape 3 — Lire les logs Nginx** (30 secondes)
+```bash
+docker logs proshop-proxy --tail 50
+```
+Les logs Nginx donnent l'URL upstream tentée et l'erreur précise : `connect() failed (113:
+Host is unreachable)` = pas de réseau ; `(110: Operation timed out)` = backend bloqué.
+
+**Étape 4 — Lire les logs backend** (1 minute)
+```bash
+docker logs proshop-backend --tail 100
+```
+Trois signaux typiques :
+- Pas de logs récents → app crashée ou bloquée
+- Stack trace d'erreur → bug applicatif identifiable directement (souvent ligne de code en
+  cause)
+- `MongoNotConnectedError` → la DB est inaccessible (pas le backend en soi)
+
+**Étape 5 — Inspecter le conteneur de plus près** (1 minute)
+```bash
+docker inspect proshop-backend --format '{{.State.Status}} {{.State.Health.Status}}'
+docker exec proshop-backend wget -qO- http://localhost:5000/api/health
+docker stats proshop-backend --no-stream
+```
+Permet de voir l'état du healthcheck Docker intégré, tester l'endpoint **depuis l'intérieur**
+du conteneur (élimine les problèmes réseau), et vérifier la consommation CPU/RAM (un backend
+qui sature la RAM va swap et devenir lent).
+
+**Étape 6 — Vérifier la DB** (30 secondes)
+```bash
+docker exec proshop-mongo mongosh --eval "db.adminCommand('ping')"
+docker logs proshop-mongo --tail 50
+```
+Si MongoDB est down ou en restauration, le backend peut tourner mais répondre 500 sur
+toutes les routes qui touchent à la DB.
+
+**Étape 7 — Vérifier le réseau Docker** (1 minute)
+```bash
+docker network inspect proshop-net
+docker exec proshop-proxy ping -c 2 backend
+```
+Détecte une éventuelle corruption du DNS interne Docker (rare mais possible après un crash
+docker engine).
+
+**Étape 8 — Consulter le pipeline Jenkins** (1 minute)
+Aller sur http://127.0.0.1:8080 → `proshop-pipeline` → dernier build. Si le pipeline est
+rouge, on a probablement la cause racine (un commit récent qui a cassé). Si le pipeline est
+vert mais la prod est down, c'est plus subtil (config différente, données en cause, etc.).
+
+**Total : moins de 5 minutes** pour avoir un diagnostic précis grâce à l'observabilité de
+base (logs structurés via `docker logs`, healthchecks, isolation par conteneur).
+
