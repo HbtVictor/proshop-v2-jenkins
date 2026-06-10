@@ -703,3 +703,202 @@ C'est aussi le bon endroit pour faire des sauvegardes : un `tar` du volume = bac
 de Jenkins (à faire à froid, conteneur stoppé). Pour restaurer dans un autre environnement,
 on extrait le tar dans un nouveau volume et on remonte le tout.
 
+---
+
+## P.6 — Pipeline Declarative (Jenkinsfile)
+
+### Fichiers livrés
+
+- **`Jenkinsfile`** à la racine du repo — Pipeline Declarative en 4 stages.
+- **`jenkins/Dockerfile`** — image Jenkins custom qui ajoute le client `docker` CLI et
+  Node.js 20 au-dessus de l'image officielle (utile pour les stages Install, Test, Build).
+
+### Structure du Jenkinsfile
+
+```groovy
+pipeline {
+  agent any
+  environment { NODE_ENV = 'production'; APP_NAME = 'proshop-v2' }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '10'))
+    timeout(time: 30, unit: 'MINUTES')
+    timestamps()
+  }
+  stages {
+    stage('Checkout') { steps { checkout scm; sh 'git log --oneline -5' } }
+    stage('Install')  { steps { sh 'npm ci' } }
+    stage('Test')     { steps { sh '... smoke test ...' } }
+    stage('Build')    { steps { sh 'docker build -t proshop-backend:ci-${BUILD_NUMBER} -f backend/Dockerfile .' } }
+  }
+  post {
+    success { echo "Pipeline OK - build #${BUILD_NUMBER} reussi" }
+    failure { echo "Pipeline ECHOUE - voir les logs ci-dessus" }
+    always  { echo "Pipeline termine (succes ou echec)" }
+  }
+}
+```
+
+### Mise en place dans Jenkins
+
+1. New Item → `proshop-pipeline` → Type **Pipeline**.
+2. Definition : **Pipeline script from SCM** → Git → URL repo → branche `*/main` → Script path
+   `Jenkinsfile`.
+3. Save → Build Now.
+4. La **Stage View** affiche les 4 stages en colonnes, avec leur durée respective.
+
+### Expérimentation d'un échec volontaire (Q21)
+
+J'ai introduit volontairement `sh 'cette-commande-nexiste-pas-volontairement'` dans le stage
+Test, poussé sur main, relancé le pipeline → observation :
+
+- Stages **Checkout** et **Install** passent au vert.
+- Stage **Test** échoue immédiatement à la première sh-commande inconnue (`exit code: 127`).
+- Le pipeline **s'arrête net** au stage Test : le stage **Build n'est PAS exécuté** (skip
+  automatique). La Stage View affiche le 4ème stage en gris/transparent.
+- Le `post { failure { ... } }` s'exécute pour logger un message d'erreur.
+- Le `post { always { ... } }` s'exécute aussi (succès ou échec).
+- Le build est marqué **FAILURE** dans la Build History (boule rouge).
+
+Après correction (`git commit + push`) et nouveau build, les 4 stages repassent au vert.
+
+### Réponses Q18-Q21
+
+**Q18 — Pipeline as Code : avantages**
+
+Le principe **Pipeline as Code** consiste à définir le pipeline CI/CD dans un fichier
+versionné dans le repo Git du projet (`Jenkinsfile`), au même titre que le code applicatif.
+C'est l'opposé de la config "click-ops" où on configure le job uniquement dans l'UI Jenkins.
+
+Avantages concrets de stocker le Jenkinsfile dans le repo :
+
+1. **Versionning et historique**. Chaque modification du pipeline est tracée par git :
+   qui a changé quoi, quand, pourquoi (via le message de commit). On peut faire un `git blame`
+   sur une ligne du pipeline pour comprendre son origine. Avec la config UI, on n'a qu'un
+   snapshot courant et un journal Jenkins très limité.
+
+2. **Branches indépendantes**. Sur une PR `feat/new-payment`, on peut modifier le Jenkinsfile
+   pour ajouter un nouveau stage spécifique à cette feature, sans impacter le pipeline de
+   `main`. Une fois la PR mergée, le nouveau pipeline est actif. Sans Pipeline as Code, le
+   pipeline est unique et global → on doit faire des modifications conditionnelles fragiles.
+
+3. **Revue de code**. Le Jenkinsfile passe par le processus de PR review classique : un autre
+   dev peut commenter, demander des changements, valider. Modifier la config Jenkins en UI
+   bypass toute revue.
+
+4. **Reproductibilité et bus factor**. Si on perd le serveur Jenkins (crash, migration, panne
+   de disque), le Jenkinsfile reste dans le repo. Recréer le job = pointer le nouveau Jenkins
+   vers le repo. La connaissance n'est plus emprisonnée dans l'instance Jenkins.
+
+5. **Tests des changements de pipeline**. On peut tester une modification du Jenkinsfile sur
+   une branche feature avant de la merger. Avec la config UI, modifier le pipeline impacte
+   immédiatement la prod.
+
+6. **Documentation auto-portée**. Le Jenkinsfile **est** la documentation officielle du
+   pipeline. Un nouveau dev qui arrive dans l'équipe lit le Jenkinsfile et comprend tout
+   (avec les commentaires). En UI, il faut des screenshots ou un partage d'écran.
+
+**Q19 — Declarative vs Scripted, recommandation pour un débutant**
+
+Jenkins propose **deux syntaxes** pour les Jenkinsfiles, basées toutes deux sur Groovy :
+
+| Critère                | Declarative                                  | Scripted                                |
+| ---------------------- | -------------------------------------------- | --------------------------------------- |
+| **Syntaxe**            | Structurée : `pipeline { agent { ... } stages { stage('X') { steps { ... } } } }` | Groovy "libre" : `node { stage('X') { sh 'cmd' } }` |
+| **Lisibilité**         | Bonne — structure imposée, sections explicites | Variable — dépend de la discipline du dev |
+| **Erreurs de syntaxe** | Détectées au parsing avant exécution         | Découvertes uniquement en runtime       |
+| **Puissance**          | Limitée (mais ~95% des besoins couverts)     | Totale (Groovy complet : boucles, classes, fonctions) |
+| **Validation IDE**     | Plugin Jenkins valide la syntaxe              | Plus difficile                          |
+| **Stages parallèles**  | Syntaxe dédiée `parallel { ... }`             | Faisable mais plus verbeux              |
+| **Intégration Blue Ocean** | Excellente (parsing structuré)            | Limitée                                 |
+
+Concrètement, **Declarative** ressemble à du YAML structuré avec des sections fixes :
+`pipeline`, `agent`, `environment`, `options`, `stages`, `post`. C'est très balisé.
+
+**Scripted** est du Groovy "à la main" : `node { ... }` à la racine, puis on appelle `stage`,
+`sh`, `dir`, etc. comme des fonctions Groovy.
+
+**Recommandation pour un débutant** : **Declarative**, sans hésiter. Les raisons :
+
+1. La structure imposée force à respecter les bonnes pratiques (séparation stages / steps /
+   post).
+2. Les erreurs de syntaxe sont détectées immédiatement, pas en plein milieu d'un build long.
+3. La doc officielle Jenkins est plus claire pour Declarative.
+4. 95% des pipelines de production tiennent en Declarative.
+5. Si on a besoin de Groovy custom (boucles complexes, etc.), on peut **encapsuler dans un
+   bloc `script { ... }`** au sein d'un stage Declarative — meilleur des deux mondes.
+
+Scripted reste utile pour des pipelines très dynamiques (ex: déployer N stages selon le contenu
+d'un fichier de config), mais c'est rare. On y vient quand on en a vraiment besoin.
+
+**Q20 — Le bloc `post { }`**
+
+Le bloc `post { }` définit des actions à exécuter **après** la fin du pipeline (ou d'un stage
+si imbriqué dans `stages.stage`). C'est le mécanisme principal pour faire du *cleanup*, des
+notifications, des publications d'artefacts conditionnelles, etc.
+
+Les trois conditions principales :
+
+- **`always { ... }`** : s'exécute **toujours**, quel que soit le résultat (succès, échec,
+  abort, instable, etc.). Cas d'usage typiques :
+  - Cleanup d'un workspace (`deleteDir()`)
+  - Stop d'un conteneur de test (`docker stop test-db`)
+  - Publication des logs (`archiveArtifacts 'logs/*.log'`)
+  - Métriques de durée envoyées à un système de monitoring
+
+- **`success { ... }`** : s'exécute **uniquement** si le pipeline termine en SUCCESS. Cas
+  d'usage :
+  - Notification Slack/email "Build #42 vert"
+  - Tag de l'image Docker comme `latest` (on ne tague pas latest si le build a foiré)
+  - Déclencher un autre pipeline aval (déploiement)
+
+- **`failure { ... }`** : s'exécute **uniquement** si le pipeline termine en FAILURE. Cas
+  d'usage :
+  - Notification d'incident (page d'astreinte)
+  - Rollback automatique d'un déploiement partiel
+  - Création automatique d'un ticket dans Jira
+
+Autres conditions disponibles : `aborted`, `unstable`, `changed` (résultat différent du
+précédent build), `fixed` (passe de FAILURE à SUCCESS), `regression` (passe de SUCCESS à
+FAILURE).
+
+L'ordre d'exécution est garanti : `always` puis `changed` puis le résultat spécifique. Les
+conditions sont indépendantes : si on déclare `always` et `success`, les deux s'exécutent en
+cas de succès.
+
+**Q21 — Que se passe-t-il quand un stage échoue ?**
+
+Le comportement par défaut d'un pipeline Declarative en cas d'échec d'un stage :
+
+1. **Arrêt immédiat du pipeline**. Le stage en cours retourne un exit code non-zéro (ou lève
+   une exception), Jenkins marque le stage en FAILURE.
+2. **Les stages suivants ne sont PAS exécutés**. Ils sont marqués comme "Not executed" dans
+   la Stage View — visuellement en transparence/gris, alignés avec les autres mais sans
+   couleur ni durée.
+3. **Le pipeline complet est marqué FAILURE** (boule rouge dans Build History, badge "X" dans
+   la Stage View).
+4. **Le bloc `post { failure { ... } }` s'exécute** (s'il est défini), pour permettre une
+   notification.
+5. **Le bloc `post { always { ... } }` s'exécute aussi** (pour le cleanup).
+
+C'est le comportement souhaité 99% du temps : si le test échoue, on ne veut pas builder
+l'image, ni la pousser, ni déployer. Le principe : **fail fast**.
+
+Dans la Stage View concrètement, après mon expérimentation Q21 :
+
+```
+Checkout    Install    Test          Build
+   ✓           ✓          ✗            ·
+  3s         11s        2s          (skip)
+```
+
+Les stages réussis gardent leur durée. Le stage en échec affiche la croix rouge. Les stages
+suivants sont en pointillés / transparents.
+
+Si on **veut absolument** qu'un stage continue malgré l'échec d'un précédent (cas très rare,
+ex: publier les logs même en cas de fail), on peut utiliser :
+- `catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { ... }` autour des commandes
+- Ou un stage avec `when { not { equals expected: 'FAILURE', actual: currentBuild.result } }`
+
+Mais ce sont des exceptions. Le comportement par défaut "arrêt au premier échec" est la
+bonne pratique.
+
