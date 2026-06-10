@@ -56,9 +56,9 @@ pipeline {
     stage('Test') {
       steps {
         echo "Tests de coherence du projet..."
-        // ECHEC VOLONTAIRE — Q21 du TP : observer le comportement
-        // d'un pipeline qui echoue. Sera corrige au commit suivant.
-        sh 'cette-commande-nexiste-pas-volontairement'
+        // Le projet upstream n'a pas de tests unitaires Jest configures.
+        // On fait un smoke test : verifie la presence des fichiers cles
+        // et la validite syntaxique de package.json.
         sh '''
           test -f backend/server.js || (echo "MISSING backend/server.js" && exit 1)
           test -f frontend/package.json || (echo "MISSING frontend/package.json" && exit 1)
