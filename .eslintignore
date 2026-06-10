@@ -1,0 +1,5 @@
+# Le seeder est un script utilitaire upstream (Brad Traversy) qui utilise
+# `colors` via la pollution globale String.prototype — pratique non-strictement
+# lintable mais fonctionnelle. On l'exclut du lint pour ne pas modifier le code
+# upstream.
+seeder.js

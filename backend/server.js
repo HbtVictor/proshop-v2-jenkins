@@ -20,6 +20,18 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
+// Endpoint health check : utilisé par le pipeline Jenkins (stage Health Check),
+// par Nginx (proxy_pass health) et par Docker (healthcheck du conteneur).
+// Volontairement indépendant de MongoDB pour pouvoir détecter un crash app
+// même si la DB est en panne.
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'proshop-backend',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.use('/api/products', productRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/orders', orderRoutes);

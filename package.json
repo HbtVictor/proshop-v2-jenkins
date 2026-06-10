@@ -12,6 +12,8 @@
     "data:import": "node backend/seeder",
     "data:destroy": "node backend/seeder -d",
     "build": "npm install && npm install --prefix frontend && npm run build --prefix frontend",
+    "lint": "eslint backend --max-warnings=0",
+    "lint:fix": "eslint backend --fix",
     "generate-toc": "markdown-toc -i readme.md"
   },
   "author": "Brad Traversy",
@@ -29,6 +31,7 @@
   "devDependencies": {
     "@types/express": "^4.17.17",
     "concurrently": "^7.6.0",
+    "eslint": "^8.57.1",
     "markdown-toc": "^1.2.0",
     "nodemon": "^2.0.21"
   }

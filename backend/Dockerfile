@@ -40,11 +40,11 @@ USER node
 # Documentation : on expose le port 5000 (Express).
 EXPOSE 5000
 
-# Healthcheck : Express répond `404 notFound` pour les routes inconnues,
-# mais répond bien sur `/api/products` (route publique). On utilise wget
-# (présent dans alpine) pour un check léger.
+# Healthcheck : on appelle l'endpoint /api/health qui est indépendant
+# de MongoDB (l'app peut être saine même si la DB est down — c'est
+# souvent ce qu'on veut détecter).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- http://localhost:5000/api/products > /dev/null || exit 1
+  CMD wget -qO- http://localhost:5000/api/health > /dev/null || exit 1
 
 # Le seeder n'est pas exécuté ici — il sera lancé manuellement via
 # `docker compose run backend npm run data:import` une fois MongoDB up.
