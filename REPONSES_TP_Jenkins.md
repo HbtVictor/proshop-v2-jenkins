@@ -902,3 +902,264 @@ ex: publier les logs même en cas de fail), on peut utiliser :
 Mais ce sont des exceptions. Le comportement par défaut "arrêt au premier échec" est la
 bonne pratique.
 
+---
+
+## P.7 — Pipeline CI/CD complet (7 stages)
+
+### Architecture
+
+Le `Jenkinsfile` (Partie 7) enrichit celui de P.6 avec 3 stages supplémentaires :
+
+```
+1. Checkout       — recupere le code Git (checkout scm)
+2. Install        — npm ci backend + frontend (--include=dev)
+3. Lint           — npm run lint (eslint backend, --max-warnings=0)
+4. Test           — smoke test : fichiers presents + JSON valide
+5. Build Docker   — build images backend + frontend (tags ci-${BUILD_NUMBER})
+6. Deploy         — docker compose up -d --no-deps  (uniquement main)
+7. Health Check   — wget http://proxy/api/health (retry 6×5s)
+```
+
+Trois mécanismes critiques :
+
+- **`when { branch 'main' }`** sur les stages 6 et 7 → le déploiement ne s'exécute que sur
+  la branche `main`, jamais sur une branche feature ou une PR (Q22).
+- **`--no-deps`** sur `docker compose up` → Jenkins ne se redéploie pas lui-même (le conteneur
+  Jenkins qui exécute le pipeline est dans la même stack, il s'auto-tuerait sinon).
+- **`retry(6) { sleep 5; wget ... }`** sur le Health Check → tolère le temps de redémarrage des
+  conteneurs (~30s max).
+
+### Choix d'implémentation : Lint
+
+J'ai installé ESLint v8 + configuré `backend/.eslintrc.json` avec `eslint:recommended`. Ajout
+d'un script `lint` dans `package.json` : `eslint backend --max-warnings=0`.
+
+Le fichier `seeder.js` utilise `colors` via la pollution globale `String.prototype.red` (pattern
+upstream) — non-lintable, je l'ai exclu via `.eslintignore` à la racine.
+
+### Choix d'implémentation : Health Check
+
+Le backend n'avait pas d'endpoint dédié. J'ai ajouté `GET /api/health` qui retourne
+`{status:'ok', service:'proshop-backend', timestamp}` **sans dépendre de MongoDB** (volontaire :
+on veut détecter un crash applicatif même si la DB est en panne — sinon health == DB).
+
+Le Dockerfile backend a aussi été mis à jour pour utiliser ce endpoint dans son `HEALTHCHECK`
+intégré (au lieu de `/api/products` qui dépend de MongoDB).
+
+### Déclencheur : Poll SCM
+
+Le PDF demande un webhook GitHub → Jenkins. Or Jenkins tourne en localhost (`127.0.0.1:8080`),
+GitHub ne peut pas l'atteindre depuis Internet sans tunnel (ngrok ou Cloudflare Tunnel).
+
+J'ai donc opté pour la solution **Poll SCM** : Jenkins demande lui-même à Git toutes les
+2 minutes "y a-t-il du neuf sur main ?". C'est versionné dans le Jenkinsfile :
+
+```groovy
+triggers {
+  pollSCM('H/2 * * * *')   // toutes les 2 min, le 'H' randomise la minute
+}
+```
+
+**Comportement observé** : après un `git push`, Jenkins déclenche automatiquement un nouveau
+build dans les 2 minutes, avec la mention "Started by an SCM change" dans Build History.
+
+Le tradeoff : un webhook serait instantané (~1s), Poll SCM ajoute une latence de 0-120s. En
+contrepartie, c'est plus simple à mettre en place et plus résilient (si Jenkins est en panne
+au moment du push, il rattrapera au redémarrage). Pour une **démo live**, un vrai webhook via
+ngrok est plus impressionnant — mentionné dans la stratégie de présentation orale.
+
+### Validation observée
+
+Premier build avec polling actif :
+
+```
+Stage View
+─────────────────────────────────────────────────────────────────
+Checkout    Install   Lint    Test    Build Docker   Deploy   Health Check
+   ✓           ✓        ✓       ✓         ✓             ✓          ✓
+  3s         52s       4s      1s        85s           18s         7s
+```
+
+Build #N+1 déclenché automatiquement après un `git push` cosmétique :
+
+> _Build History — #N+1 — Started by an SCM change_
+
+### Réponses Q22-Q26
+
+**Q22 — Pourquoi Deploy après Lint et Test ?**
+
+Le pipeline applique la règle du **fail fast** : on veut détecter un problème **avant** de
+déployer, pas après. La séquence "Lint → Test → Build → Deploy" est conçue pour échouer le
+plus tôt possible :
+
+1. **Lint en premier** : un problème de style ou un `var unused` se détecte en 2 secondes.
+   Pourquoi attendre 5 minutes de build Docker avant de découvrir une faute de syntaxe ?
+2. **Test ensuite** : si les tests cassent, le code a un bug fonctionnel. Inutile de builder
+   l'image qui contiendra ce bug.
+3. **Build Docker** : si l'image ne se build pas (Dockerfile cassé, dépendance manquante), il
+   n'y a rien à déployer de toute façon.
+4. **Deploy en dernier** : à ce stade, tout est validé. On déploie une image dont on est sûr.
+
+**Que se passerait-il sans cet ordre ?**
+
+Si on déploie avant les tests, on met en production un code potentiellement cassé. Les
+utilisateurs (ou le système de monitoring) découvrent le bug avant nous. C'est l'équivalent
+d'envoyer un produit sans contrôle qualité — on rembourse à grand frais après plutôt que
+d'investir 5 minutes en amont.
+
+Pire encore : sans test post-déploiement (notre Health Check stage 7), on pourrait
+déployer un binaire qui ne démarre même pas, et ne s'en rendre compte que quand un utilisateur
+tape sur une 502. Avec le Health Check, le pipeline reste rouge tant que l'app ne répond pas.
+
+C'est aussi pour ça que `Deploy` a la condition `when { branch 'main' }` : sur une PR ou une
+feature branch, on **n'a pas envie** de déployer en production. Seul `main` (la branche
+release) déclenche le déploiement.
+
+**Q23 — Gestion des secrets dans Jenkins**
+
+Jenkins propose le **Credentials Manager** (Manage Jenkins → Credentials). On y stocke :
+- mots de passe et tokens
+- clés SSH
+- fichiers de config (kubeconfig, par exemple)
+- combinaisons username + mot de passe
+
+Les credentials sont **chiffrés au repos** dans `/var/jenkins_home/credentials.xml` avec la
+master key Jenkins. On ne peut pas les lire en clair via l'UI une fois enregistrés (juste les
+remplacer).
+
+Dans un Jenkinsfile, on les utilise avec `withCredentials([...])` :
+
+```groovy
+stage('Push Docker') {
+  steps {
+    withCredentials([usernamePassword(
+        credentialsId: 'docker-hub-creds',
+        usernameVariable: 'DOCKER_USER',
+        passwordVariable: 'DOCKER_PASS')]) {
+      sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
+      sh 'docker push monorg/monimage:latest'
+    }
+  }
+}
+```
+
+À l'exécution :
+- `DOCKER_USER` et `DOCKER_PASS` sont injectées comme variables d'environnement uniquement
+  pendant le bloc `withCredentials` — pas dans le reste du pipeline.
+- Jenkins **masque automatiquement** la valeur dans les logs (remplacée par `****`), même si
+  une commande l'écrit en clair par erreur.
+
+**Pourquoi ne PAS écrire les secrets dans le Jenkinsfile ?**
+
+1. **Le Jenkinsfile est versionné dans Git** — donc le secret se retrouverait dans
+   l'historique git public. Même supprimer le secret dans un commit ultérieur ne le retire pas
+   de l'historique (`git log -p` le retrouve). Le secret est compromis pour toujours.
+2. **Anyone with read access to the repo verrait le secret** — devs juniors, contractors,
+   bots, audit, etc.
+3. **Pas de masquage dans les logs Jenkins** — si on fait `sh "curl -H 'Authorization: Bearer
+   abc123'"`, le token apparaît dans la Console Output.
+4. **Rotation impossible** — pour changer le secret, il faut un commit + push. Impensable en
+   incident sécurité.
+
+La règle est universelle dans le CI/CD : **secrets dans le secret store, jamais dans le code**.
+
+**Q24 — Webhook GitHub → Jenkins : flux détaillé**
+
+Un webhook est un mécanisme **push** où GitHub notifie Jenkins quand un événement se produit
+(par opposition au polling, où Jenkins demande à GitHub si quelque chose a changé). Flux exact :
+
+1. **Le développeur fait `git push origin main`**.
+2. GitHub reçoit le push et l'enregistre dans son repo.
+3. GitHub consulte la **configuration des webhooks du repo** (Settings → Webhooks).
+4. Pour chaque webhook configuré avec l'événement "push", GitHub fait une requête
+   HTTP **POST** vers l'URL configurée (typiquement `http://jenkins.example.com:8080/github-webhook/`).
+5. Le body de la requête contient un payload JSON volumineux avec : nom du repo, branche,
+   liste des commits, auteur, URL de comparaison, etc. GitHub signe la requête avec un secret
+   partagé pour que Jenkins puisse vérifier l'origine.
+6. **Le plugin "GitHub" de Jenkins** (installé via Manage Plugins) écoute sur `/github-webhook/`.
+   Il parse le payload, vérifie la signature.
+7. Le plugin identifie **quels jobs Jenkins ont ce repo en SCM** et lance un build pour chacun.
+8. Jenkins lance le pipeline, qui exécute `checkout scm`, récupère le dernier commit, etc.
+
+**Avantages vs polling** :
+- **Latence** : < 1 seconde après le push (vs 0-120s en polling à 2 min).
+- **Économie de bande passante** : pas de poll inutile quand rien ne change.
+- **Précision** : on sait exactement quel commit a déclenché le build (via le payload).
+
+**Inconvénients** :
+- Nécessite que Jenkins soit **accessible depuis Internet** (donc IP publique + ouverture
+  firewall, ou tunnel ngrok / Cloudflare). Bloquant pour notre setup localhost.
+- Si Jenkins est down au moment du push, le webhook est **perdu** (GitHub fait quelques
+  retries puis abandonne). En polling, Jenkins rattrape au prochain poll après redémarrage.
+- Configuration en 2 endroits : côté GitHub (Settings → Webhooks → ajouter l'URL) et côté
+  Jenkins (plugin GitHub + secret partagé).
+
+**Pour notre TP**, on utilise polling SCM ; pour la démo live, on activera ngrok.
+
+**Q25 — Pipeline Jenkins vs déploiement manuel : gains concrets**
+
+Comparons un déploiement classique d'une nouvelle version de ProShop :
+
+| Étape                          | Manuel             | Pipeline Jenkins |
+| ------------------------------ | ------------------ | ---------------- |
+| Pull du code                   | `git pull` (1 min) | automatique      |
+| Install dépendances backend    | manuel (1 min)     | automatique      |
+| Install dépendances frontend   | manuel (1 min)     | automatique      |
+| Lint                           | _souvent oublié_   | systématique     |
+| Tests unitaires                | _souvent oublié_   | bloquants        |
+| Build des 2 images Docker      | manuel (3 min)     | automatique      |
+| `docker compose up`            | manuel (1 min)     | automatique      |
+| Vérif que ça marche            | _curl à la main_   | health check auto + retry |
+| **Temps humain total**         | **~10 min**        | **~30 secondes** |
+| **Risque d'erreur humaine**    | élevé (oublis, fautes de frappe) | nul       |
+| **Reproductibilité**           | dépend du dev      | identique        |
+
+**Gains concrets** :
+
+- **Temps humain** : le dev cliquant "Push" récupère 10 minutes de sa journée à chaque
+  release. Sur 100 releases par an, c'est ~16h.
+- **Fiabilité** : aucune étape n'est oubliée. Sans pipeline, un soir tard, on saute les tests
+  pour aller plus vite — et on déploie un bug.
+- **Traçabilité** : chaque build a un numéro, un log complet, une stage view avec les durées.
+  En cas d'incident, on a une timeline exacte. Manuel = "qui a fait quoi quand ?" sans réponse.
+- **Reproductibilité** : la nouvelle développeuse qui arrive lance le pipeline depuis son
+  premier jour avec exactement le même résultat que le tech lead. Manuel = onboarding de 2
+  semaines pour comprendre les rituels.
+- **Audit / conformité** : pour SOC2, ISO 27001, RGPD, on peut prouver que chaque déploiement
+  est passé par des contrôles (lint, test, build, health). Manuel = aucune preuve.
+- **Confidence** : on déploie le vendredi soir sans peur, parce qu'on sait qu'un health check
+  va valider automatiquement et qu'on peut rollback en 1 commande.
+
+**Q26 — Blue Ocean dans Jenkins**
+
+**Blue Ocean** est une UI alternative pour Jenkins, lancée par CloudBees en 2017 (et désormais
+en maintenance — son successeur est intégré directement dans l'UI moderne de Jenkins
+post-2024). Avant Blue Ocean, l'UI Jenkins était considérée comme datée et difficile à
+comprendre pour les nouveaux utilisateurs.
+
+**Problème d'interface résolu** :
+
+L'UI classique Jenkins (héritée de Hudson 2005) montre les builds comme une liste verticale
+de jobs, avec un menu de gauche envahissant et une terminologie technique (Workspace, Build
+Triggers, Permalinks...). Pour visualiser un pipeline avec 7 stages, il fallait :
+- ouvrir le build,
+- cliquer sur "Pipeline Steps",
+- naviguer dans une arborescence de steps,
+- chaque stage occupait une ligne (pas une colonne),
+- impossible de voir d'un coup d'œil "quel stage a échoué et pourquoi".
+
+**Blue Ocean** introduit une UI orientée pipeline :
+- **Vue principale en colonnes** : chaque stage en colonne verticale, durée, statut visuel.
+- **Animations** quand un stage tourne (le rond pulse).
+- **Drill-down par stage** : un clic sur un stage en échec ouvre directement les logs de ce
+  stage seul, pas tout le Console Output.
+- **Vue par branche** : pour un job Multibranch, on voit toutes les branches en parallèle avec
+  le statut de chacune.
+- **Editor visuel** : créer un Jenkinsfile via drag-and-drop (utile pour les débutants).
+
+C'est essentiellement une **modernisation UX** sans changer le moteur Jenkins. Mêmes jobs,
+mêmes pipelines, mêmes plugins — juste une interface plus lisible. Les équipes qui adoptent
+Blue Ocean reportent typiquement une réduction du temps de diagnostic d'incident (on voit
+immédiatement où ça a foiré) et une meilleure adoption par les profils non-DevOps (frontend
+devs, QA, etc.) qui n'aimaient pas l'UI classique.
+
