@@ -63,9 +63,12 @@ pipeline {
     stage('Install') {
       steps {
         echo "[Stage 2/7] Install dependencies"
-        // Backend a la racine + frontend dans son propre dossier.
-        sh 'npm ci'
-        sh 'npm ci --prefix frontend'
+        // --include=dev force l'install des devDependencies meme quand
+        // NODE_ENV=production est defini dans l'environment du pipeline
+        // (sinon npm les ignore et eslint n'est pas installe → stage Lint
+        // echoue avec 'eslint: not found').
+        sh 'npm ci --include=dev'
+        sh 'npm ci --include=dev --prefix frontend'
       }
     }
 
